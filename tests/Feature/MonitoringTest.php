@@ -10,6 +10,8 @@ use App\Services\NotificationService;
 use App\Services\PingResult;
 use App\Services\PingService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
@@ -62,6 +64,27 @@ class MonitoringTest extends TestCase
         $this->mock(PingService::class, fn ($m) => $m->shouldReceive('check')->once()->andReturn(new PingResult(false, null, 100, 'timeout', 'Timed out')));
         app()->call([new MonitorHost($host->id), 'handle']);
         $this->assertDatabaseHas('monitoring_incidents', ['monitored_host_id' => $host->id, 'status' => 'open']);
+    }
+
+    public function test_recovery_stores_a_whole_number_duration(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-09-28 11:47:50.750000'));
+
+        try {
+            $host = MonitoredHost::create(['name' => 'Recovered', 'ip_address' => '192.0.2.2', 'enabled' => true, 'interval_seconds' => 60, 'timeout_ms' => 1000, 'latency_threshold_ms' => 200, 'retry_count' => 3, 'current_status' => 'down']);
+            $incident = $host->incidents()->create(['started_at' => now()->subSeconds(5), 'reason' => 'timeout', 'status' => 'open']);
+            $this->mock(PingService::class, fn ($m) => $m->shouldReceive('check')->once()->andReturn(new PingResult(true, 4.2, 0)));
+
+            app()->call([new MonitorHost($host->id), 'handle']);
+
+            $duration = DB::table('monitoring_incidents')->where('id', $incident->id)->value('duration_seconds');
+            $this->assertIsInt($duration);
+            $this->assertSame(5, $duration);
+            $this->assertDatabaseHas('monitoring_incidents', ['id' => $incident->id, 'status' => 'resolved']);
+            $this->assertSame('active', $host->fresh()->current_status);
+        } finally {
+            Carbon::setTestNow();
+        }
     }
 
     public function test_telegram_down_alert_contains_operational_details(): void

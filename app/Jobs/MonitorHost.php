@@ -60,7 +60,11 @@ class MonitorHost implements ShouldQueue, ShouldBeUnique
                 } elseif ($status !== 'down' && $previous === 'down') {
                     $incident = MonitoringIncident::where('monitored_host_id', $host->id)->where('status', 'open')->latest('started_at')->first();
                     if ($incident) {
-                        $incident->update(['recovered_at' => $now, 'duration_seconds' => $incident->started_at->diffInSeconds($now), 'status' => 'resolved']);
+                        $incident->update([
+                            'recovered_at' => $now,
+                            'duration_seconds' => (int) floor($incident->started_at->diffInSeconds($now, true)),
+                            'status' => 'resolved',
+                        ]);
                     }$notifications->send($host, 'recovered');
                 }
             });
