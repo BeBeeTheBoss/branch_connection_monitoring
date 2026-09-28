@@ -66,6 +66,54 @@ class MonitoringTest extends TestCase
         $this->assertDatabaseHas('monitoring_incidents', ['monitored_host_id' => $host->id, 'status' => 'open']);
     }
 
+    public function test_down_notification_waits_for_five_minutes_of_continuous_downtime(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-09-28 12:00:00'));
+
+        try {
+            Http::fake(['api.telegram.org/*' => Http::response(['ok' => true])]);
+            NotificationChannel::create(['name' => 'Telegram Alerts', 'type' => 'telegram', 'enabled' => true, 'configuration' => ['bot_token' => 'test-token', 'chat_id' => '123456']]);
+            $host = MonitoredHost::create(['name' => 'Delayed Alert', 'ip_address' => '192.0.2.3', 'enabled' => true, 'interval_seconds' => 60, 'timeout_ms' => 1000, 'latency_threshold_ms' => 200, 'retry_count' => 3]);
+            $this->mock(PingService::class, fn ($m) => $m->shouldReceive('check')->times(3)->andReturn(new PingResult(false, null, 100, 'timeout', 'Timed out')));
+
+            app()->call([new MonitorHost($host->id), 'handle']);
+            Http::assertNothingSent();
+
+            Carbon::setTestNow(Carbon::parse('2026-09-28 12:04:59'));
+            app()->call([new MonitorHost($host->id), 'handle']);
+            Http::assertNothingSent();
+
+            Carbon::setTestNow(Carbon::parse('2026-09-28 12:05:00'));
+            app()->call([new MonitorHost($host->id), 'handle']);
+
+            Http::assertSentCount(1);
+            $this->assertDatabaseHas('notification_logs', ['monitored_host_id' => $host->id, 'event' => 'down', 'status' => 'sent']);
+        } finally {
+            Carbon::setTestNow();
+        }
+    }
+
+    public function test_recovery_before_delay_does_not_send_a_recovery_notification(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-09-28 12:04:00'));
+
+        try {
+            Http::fake(['api.telegram.org/*' => Http::response(['ok' => true])]);
+            NotificationChannel::create(['name' => 'Telegram Alerts', 'type' => 'telegram', 'enabled' => true, 'configuration' => ['bot_token' => 'test-token', 'chat_id' => '123456']]);
+            $host = MonitoredHost::create(['name' => 'Brief Outage', 'ip_address' => '192.0.2.4', 'enabled' => true, 'interval_seconds' => 60, 'timeout_ms' => 1000, 'latency_threshold_ms' => 200, 'retry_count' => 3, 'current_status' => 'down']);
+            $incident = $host->incidents()->create(['started_at' => now()->subMinutes(4), 'reason' => 'timeout', 'status' => 'open']);
+            $this->mock(PingService::class, fn ($m) => $m->shouldReceive('check')->once()->andReturn(new PingResult(true, 4.2, 0)));
+
+            app()->call([new MonitorHost($host->id), 'handle']);
+
+            Http::assertNothingSent();
+            $this->assertDatabaseHas('monitoring_incidents', ['id' => $incident->id, 'status' => 'resolved']);
+            $this->assertSame('active', $host->fresh()->current_status);
+        } finally {
+            Carbon::setTestNow();
+        }
+    }
+
     public function test_recovery_stores_a_whole_number_duration(): void
     {
         Carbon::setTestNow(Carbon::parse('2026-09-28 11:47:50.750000'));

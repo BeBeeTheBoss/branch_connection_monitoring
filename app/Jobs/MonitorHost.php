@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\MonitoredHost;
 use App\Models\MonitoringIncident;
+use App\Models\NotificationLog;
 use App\Models\MonitoringResult;
 use App\Services\NotificationService;
 use App\Services\PingService;
@@ -56,16 +57,32 @@ class MonitorHost implements ShouldQueue, ShouldBeUnique
                 }$host->save();
                 if ($status === 'down' && $previous !== 'down') {
                     MonitoringIncident::create(['monitored_host_id' => $host->id, 'started_at' => $now, 'reason' => $result->errorCode ?: 'No ICMP response', 'status' => 'open']);
-                    $notifications->send($host, 'down');
+                } elseif ($status === 'down') {
+                    $incident = MonitoringIncident::where('monitored_host_id', $host->id)->where('status', 'open')->latest('started_at')->first();
+                    $delayMinutes = max(1, (int) config('monitoring.down_notification_delay_minutes', 5));
+                    $notificationAttempted = $incident && NotificationLog::where('monitored_host_id', $host->id)->where('event', 'down')
+                        ->where('created_at', '>=', $incident->started_at)
+                        ->exists();
+
+                    if ($incident && ! $notificationAttempted && $incident->started_at->lte($now->copy()->subMinutes($delayMinutes))) {
+                        $notifications->send($host, 'down');
+                    }
                 } elseif ($status !== 'down' && $previous === 'down') {
                     $incident = MonitoringIncident::where('monitored_host_id', $host->id)->where('status', 'open')->latest('started_at')->first();
+                    $downNotificationSent = $incident && NotificationLog::where('monitored_host_id', $host->id)
+                        ->where('event', 'down')->where('status', 'sent')
+                        ->where('created_at', '>=', $incident->started_at)
+                        ->exists();
                     if ($incident) {
                         $incident->update([
                             'recovered_at' => $now,
                             'duration_seconds' => (int) floor($incident->started_at->diffInSeconds($now, true)),
                             'status' => 'resolved',
                         ]);
-                    }$notifications->send($host, 'recovered');
+                    }
+                    if ($downNotificationSent) {
+                        $notifications->send($host, 'recovered');
+                    }
                 }
             });
         } finally {
